@@ -1,0 +1,768 @@
+# =============================================================================
+#  Locust Max-RPS Stress Test — v∞++++ PATCHED EDITION
+# -----------------------------------------------------------------------------
+#  ✅ FIXES APPLIED (Based on Code Review):
+#    1. Content-Length check now ignores compressed responses (gzip/br).
+#    2. Empty body check ignores 204/205/HEAD/OPTIONS.
+#    3. Auto-injects Content-Type: application/json for mutations.
+#    4. Thundering Herd now has Cooldown, Rate-Limit, and Cache.
+#    5. Fixed Race Condition on Connection header (passed as extra_headers).
+#    6. Removed private environment attributes (using module-level state).
+#    7. Isolated logging to prevent interference with Locust root logger.
+#    8. Removed dead ENDPOINTS_STR variable.
+#    9. Fixed stat_name generation for endpoints with existing query params.
+#   10. Request exceptions now log as WARNING instead of DEBUG.
+#   11. Unified strict/non-strict failure reporting (no more 3xx inconsistency).
+#   12. IP Spoofing now excludes private/reserved ranges (10.x, 192.x, etc).
+#   13. Clamped SPAWN_RATE * 2 in Pulse mode.
+#   14. Added missing HEAVY_ENDPOINTS validation warnings.
+#   15. Health check renamed to [startup] reachability.
+#   16. ENV parsing fallbacks now log as WARNING instead of ERROR.
+#
+#  Locust compatibility: 2.x | Python: 3.8+
+# =============================================================================
+
+from __future__ import annotations
+
+import logging
+import os
+import random
+import signal
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+try:
+    import gevent
+    from gevent.pool import Group
+except ImportError:
+    sys.stderr.write("FATAL: gevent missing. Run: pip install gevent\n")
+    sys.exit(1)
+
+try:
+    from locust import FastHttpUser, LoadTestShape, task, constant, events, tag
+    from locust.runners import WorkerRunner
+except ImportError as exc:
+    sys.stderr.write(f"FATAL: locust import failed: {exc}\n")
+    sys.stderr.write("Run: pip install locust\n")
+    sys.exit(1)
+
+
+# =============================================================================
+#  Logging (Isolated to prevent Locust interference)
+# =============================================================================
+log = logging.getLogger("chaos")
+log.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
+    ))
+    log.addHandler(_handler)
+
+
+# =============================================================================
+#  Safe ENV parsing
+# =============================================================================
+def _env_int(name: str, default: int, min_val: int = 1,
+             max_val: Optional[int] = None) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = int(raw.strip())
+    except (ValueError, TypeError):
+        log.warning("ENV %s=%r not int → default %d", name, raw, default)
+        return default
+    if v < min_val or (max_val is not None and v > max_val):
+        log.warning("ENV %s=%d out of [%d,%s] → default %d",
+                    name, v, min_val, max_val, default)
+        return default
+    return v
+
+
+def _env_float(name: str, default: float, min_val: float = 0.0,
+               max_val: Optional[float] = None) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        v = float(raw.strip())
+    except (ValueError, TypeError):
+        log.warning("ENV %s=%r not float → default %s", name, raw, default)
+        return default
+    if v < min_val or (max_val is not None and v > max_val):
+        log.warning("ENV %s=%s out of range → default %s", name, v, default)
+        return default
+    return v
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw else default
+
+
+def _env_csv(name: str, default: str = "") -> Tuple[str, ...]:
+    raw = os.getenv(name, default)
+    if not raw:
+        return ()
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+# =============================================================================
+#  Configuration — core
+# =============================================================================
+TARGET_USERS  = _env_int("TARGET_USERS",  1000, 1, 500_000)
+RUN_TIME      = _env_int("RUN_TIME",      180,  10, 86_400)
+STEPS         = _env_int("STEPS",         6,    1, 1000)
+SPAWN_RATE    = _env_int("SPAWN_RATE",    100,  1, 10_000)
+POOL_SIZE     = _env_int("POOL_SIZE",     200,  10, 10_000)
+TIMEOUT       = _env_float("TIMEOUT",     5.0,  0.5, 300)
+ENDPOINT      = _env_str("ENDPOINT",      "/v1/search")
+INSECURE      = _env_bool("INSECURE",         False)
+RETRY_ON_NET  = _env_bool("RETRY_ON_NET",     False)
+STRICT        = _env_bool("STRICT_VALIDATION", True)
+SKIP_HEALTH   = _env_bool("SKIP_HEALTH_CHECK", False)
+BURST_MODE    = _env_bool("BURST_MODE",       False)
+SEED_RAW      = os.getenv("SEED")
+if SEED_RAW:
+    SEED_RAW = SEED_RAW.strip()
+
+USER_AGENT    = _env_str(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+)
+
+# =============================================================================
+#  Configuration — WILD features
+# =============================================================================
+CACHE_BUST      = _env_bool("CACHE_BUST",     False)
+PARALLEL_N      = _env_int("PARALLEL_N",      1, 1, 100)
+PARALLEL_PROB   = _env_float("PARALLEL_PROB", 0.0, 0.0, 1.0)
+HEAVY_PROB      = _env_float("HEAVY_PROB",    0.0, 0.0, 1.0)
+HEAVY_ENDPOINTS = _env_csv("HEAVY_ENDPOINTS", "")
+COLD_CONN       = _env_bool("COLD_CONN",      False)
+COLD_CONN_PROB  = _env_float("COLD_CONN_PROB", 0.0, 0.0, 1.0)
+
+SPOOF_IP        = _env_bool("SPOOF_IP",       False)
+HEADER_BOMB     = _env_bool("HEADER_BOMB",    False)
+HEADER_BOMB_KB  = _env_int("HEADER_BOMB_KB",  16, 1, 2048)
+METHOD_CHAOS    = _env_bool("METHOD_CHAOS",   False)
+MUTATION_PROB   = _env_float("MUTATION_PROB", 0.0, 0.0, 1.0)
+MUTATION_ENDPOINTS = _env_csv("MUTATION_ENDPOINTS", "/api/cart/add,/api/user/update")
+DEEP_PAGINATION = _env_bool("DEEP_PAGINATION", False)
+THUNDER_HERD    = _env_bool("THUNDER_HERD",    False)
+THUNDER_THRESHOLD = _env_float("THUNDER_THRESHOLD", 0.15, 0.01, 1.0)
+PULSE_SHAPE     = _env_bool("PULSE_SHAPE",     False)
+
+_HEADER_BOMB_VAL = "A" * (HEADER_BOMB_KB * 1024) if HEADER_BOMB else ""
+
+AUTH_TOKEN = os.getenv("AUTH_TOKEN")
+COOKIE     = os.getenv("COOKIE")
+EXTRA_HEADERS: Dict[str, str] = {}
+if AUTH_TOKEN:
+    EXTRA_HEADERS["Authorization"] = f"Bearer {AUTH_TOKEN}"
+if COOKIE:
+    EXTRA_HEADERS["Cookie"] = COOKIE
+
+
+# =============================================================================
+#  Validation & State
+# =============================================================================
+_TEST_STATE: Dict[str, Any] = {
+    "stop_flag": {"stop": False},
+    "progress_greenlet": None,
+    "watchdog_greenlet": None,
+}
+
+_HERD_STATE = {
+    "last_trigger": 0.0,
+    "count_this_minute": 0,
+    "minute_start": time.monotonic()
+}
+_HERD_CACHE = {"ts": 0.0, "active": False}
+_HERD_COOLDOWN = 5.0
+_HERD_MAX_PER_MIN = 100
+
+if STEPS > TARGET_USERS:
+    log.warning("STEPS=%d > TARGET_USERS=%d → clamping", STEPS, TARGET_USERS)
+    STEPS = TARGET_USERS
+
+_MIN_STEP_DURATION = 2.0
+if RUN_TIME / STEPS < _MIN_STEP_DURATION:
+    new_steps = max(1, int(RUN_TIME / _MIN_STEP_DURATION))
+    log.warning("step_dur too short → STEPS=%d", new_steps)
+    STEPS = new_steps
+
+if SPAWN_RATE > TARGET_USERS:
+    SPAWN_RATE = TARGET_USERS
+
+raw_eps = _env_csv("ENDPOINTS")
+_ENDPOINT_LIST = raw_eps if raw_eps else (ENDPOINT,)
+
+_NORMALIZED_ENDPOINTS: List[str] = []
+for ep in _ENDPOINT_LIST:
+    if not ep.startswith("/"):
+        log.warning("ENDPOINT=%r → prepending '/'", ep)
+        ep = "/" + ep
+    _NORMALIZED_ENDPOINTS.append(ep)
+_ENDPOINT_LIST = tuple(_NORMALIZED_ENDPOINTS)
+
+_EST_MB = (TARGET_USERS * 50) / 1024
+if _EST_MB > 4000:
+    log.warning("TARGET_USERS=%d → ~%.0f MB RAM estimated", TARGET_USERS, _EST_MB)
+
+try:
+    import resource as _res  # noqa: F401
+    _soft, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+    _needed = TARGET_USERS * 2 + POOL_SIZE
+    if _soft < _needed:
+        log.warning("open-file limit=%d, need ~%d. Run: ulimit -n %d",
+                    _soft, _needed, min(_hard, _needed))
+except (ImportError, ValueError, AttributeError):
+    pass
+
+if SEED_RAW is not None:
+    try:
+        random.seed(int(SEED_RAW))
+        log.info("Random seed = %s", SEED_RAW)
+    except ValueError:
+        log.warning("Invalid SEED=%r", SEED_RAW)
+
+# Sanity checks
+if PARALLEL_N > 1 and PARALLEL_PROB == 0.0:
+    log.warning("PARALLEL_N=%d but PARALLEL_PROB=0.0 → parallel burst disabled", PARALLEL_N)
+if HEAVY_PROB > 0.0 and not HEAVY_ENDPOINTS:
+    log.warning("HEAVY_PROB > 0 but HEAVY_ENDPOINTS is empty → heavy mix disabled")
+if HEAVY_ENDPOINTS and HEAVY_PROB == 0.0:
+    log.warning("HEAVY_ENDPOINTS set but HEAVY_PROB=0.0 → heavy mix disabled")
+if COLD_CONN and COLD_CONN_PROB == 0.0:
+    log.warning("COLD_CONN=true but COLD_CONN_PROB=0.0 → cold conn disabled")
+if MUTATION_PROB > 0.0 and not MUTATION_ENDPOINTS:
+    log.warning("MUTATION_PROB > 0 but no MUTATION_ENDPOINTS → using defaults")
+
+
+# =============================================================================
+#  Adaptive pool sizing
+# =============================================================================
+def _adaptive_pool_size() -> int:
+    if TARGET_USERS <= 1_000:
+        return min(POOL_SIZE, 50)
+    if TARGET_USERS <= 10_000:
+        return min(POOL_SIZE, 20)
+    return min(POOL_SIZE, 10)
+
+
+# =============================================================================
+#  Query dataset
+# =============================================================================
+_WORDS_A: Tuple[str, ...] = (
+    "navy", "blue", "red", "black", "white", "olive",
+    "summer", "winter", "wool", "cotton", "linen", "silk",
+    "green", "beige", "grey", "burgundy",
+)
+_WORDS_B: Tuple[str, ...] = (
+    "shirt", "dress", "hoodie", "jeans", "shoes", "bag",
+    "jacket", "scarf", "hat", "socks", "belt", "watch",
+    "coat", "skirt", "trouser", "sweater",
+)
+
+
+def _iter_search_requests() -> Any:
+    for base in _ENDPOINT_LIST:
+        base = base.rstrip()
+        sep = "&" if "?" in base else "?"
+        prefix = f"{base}{sep}q="
+        stat_name = f"GET {base}{sep}q=[pair]"  # FIX #9: Use sep here
+        for a in _WORDS_A:
+            ea = quote(a, safe="")
+            for b in _WORDS_B:
+                eb = quote(b, safe="")
+                yield (f"{prefix}{ea}%20{eb}", stat_name)
+
+
+_PREBUILT_REQUESTS: Tuple[Tuple[str, str], ...] = tuple(_iter_search_requests())
+
+# FIX #20: Assert pre-built requests
+if not _PREBUILT_REQUESTS:
+    log.critical("FATAL: No requests could be built. Check ENDPOINTS.")
+    sys.exit(1)
+
+_random_choice = random.choice
+_random_int = random.randint
+_random_random = random.random
+
+
+def _random_ip() -> str:
+    """Generate a public IPv4 address (excluding private/reserved ranges)."""
+    while True:
+        a = _random_int(1, 223)
+        b = _random_int(0, 255)
+        c = _random_int(0, 255)
+        d = _random_int(1, 254)
+        
+        # FIX #12: Filter private/reserved ranges
+        if a == 10: continue
+        if a == 127: continue
+        if a == 169 and b == 254: continue
+        if a == 172 and 16 <= b <= 31: continue
+        if a == 192 and b == 168: continue
+        if a >= 224: continue
+        
+        return f"{a}.{b}.{c}.{d}"
+
+
+def rand_request() -> Tuple[str, str]:
+    path, name = _random_choice(_PREBUILT_REQUESTS)
+    
+    if DEEP_PAGINATION and _random_random() < 0.5:
+        sep = "&" if "?" in path else "?"
+        offset = _random_int(10000, 10000000)
+        path = f"{path}{sep}offset={offset}&limit=100"
+        name = f"{name} [deep-page]"
+        
+    return path, name
+
+
+def _maybe_cache_bust(path: str) -> str:
+    if not CACHE_BUST:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}_cb={_random_int(1, 10**9)}"
+
+
+# =============================================================================
+#  User class
+# =============================================================================
+class MaxSearchUser(FastHttpUser):
+    wait_time = constant(0)
+    connection_pool_maxsize = _adaptive_pool_size()
+    network_timeout = TIMEOUT
+    insecure = INSECURE
+
+    _STAT_HEALTH   = "[startup] reachability"  # FIX #16
+    _STAT_RETRY    = "retry"
+    _STAT_PARALLEL = "parallel burst"
+    _STAT_HEAVY    = "heavy endpoint"
+    _STAT_COLD     = "cold connection"
+    _STAT_MUTATION = "mutation endpoint"
+    _STAT_HERD     = "thundering herd"
+
+    def on_start(self) -> None:
+        try:
+            self.client.headers.update(
+                {"User-Agent": USER_AGENT, **EXTRA_HEADERS}
+            )
+        except Exception as exc:
+            log.debug("Header setup failed: %s", exc)
+
+        if SKIP_HEALTH:
+            return
+
+        try:
+            with self.client.get(
+                "/",
+                name=self._STAT_HEALTH,
+                catch_response=True,
+                timeout=TIMEOUT,
+                allow_redirects=False,
+            ) as r:
+                _ = r.content
+                if r.status_code == 0:
+                    r.failure("no response")
+                else:
+                    r.success()
+        except Exception as exc:
+            log.debug("Health check failed: %s", exc)
+
+    @staticmethod
+    def _classify_network_error(r: Any) -> str:
+        exc = getattr(r, "exception", None) or getattr(r, "error", None)
+        if exc is None:
+            return "connection_error"
+        name = type(exc).__name__
+        if "Timeout" in name:
+            return "timeout"
+        if "SSL" in name or "TLS" in name:
+            return "ssl_error"
+        if "DNS" in name or "gaierror" in name:
+            return "dns_error"
+        if "Refused" in name:
+            return "connection_refused"
+        if "Reset" in name:
+            return "connection_reset"
+        if "BrokenPipe" in name:
+            return "broken_pipe"
+        return f"net_{name}"
+
+    def _is_thunder_herd_active(self) -> bool:
+        """Check if Thundering Herd should trigger (with cache and cooldown)."""
+        if not THUNDER_HERD:
+            return False
+            
+        now = time.monotonic()
+        
+        # FIX #17: Cache result for 500ms to prevent hotspot
+        if now - _HERD_CACHE["ts"] < 0.5:
+            return _HERD_CACHE["active"]
+            
+        active = False
+        
+        # FIX #4: Cooldown check
+        if now - _HERD_STATE["last_trigger"] >= _HERD_COOLDOWN:
+            # FIX #4: Rate limit check
+            if now - _HERD_STATE["minute_start"] > 60.0:
+                _HERD_STATE["minute_start"] = now
+                _HERD_STATE["count_this_minute"] = 0
+                
+            if _HERD_STATE["count_this_minute"] < _HERD_MAX_PER_MIN:
+                try:
+                    s = self.environment.stats.total
+                    if s.num_requests > 100:
+                        # FIX #4: Raise threshold if METHOD_CHAOS is on (to avoid 4xx false triggers)
+                        effective_threshold = THUNDER_THRESHOLD
+                        if METHOD_CHAOS or MUTATION_PROB > 0:
+                            effective_threshold = max(effective_threshold, 0.30)
+                            
+                        fail_rate = s.num_failures / s.num_requests
+                        if fail_rate >= effective_threshold:
+                            _HERD_STATE["last_trigger"] = now
+                            _HERD_STATE["count_this_minute"] += 1
+                            active = True
+                except Exception:
+                    pass
+                    
+        _HERD_CACHE["ts"] = now
+        _HERD_CACHE["active"] = active
+        return active
+
+    def _roll_method_and_data(self) -> Tuple[str, Any]:
+        if METHOD_CHAOS:
+            m = _random_choice(["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
+            if m in ("POST", "PUT", "PATCH"):
+                return m, b'{"chaos": true, "ts": ' + str(int(time.time())).encode() + b'}'
+            return m, None
+        return "GET", None
+
+    def _do_request(self, path: str, name: str, method: str = "GET", 
+                    body: Any = None, extra_headers: Optional[Dict[str, str]] = None) -> None:
+        """Execute request with validation and chaos injection."""
+        chaos_headers = {}
+        if extra_headers:
+            chaos_headers.update(extra_headers)
+            
+        if SPOOF_IP:
+            ip = _random_ip()
+            chaos_headers["X-Forwarded-For"] = ip
+            chaos_headers["X-Real-IP"] = ip
+        if HEADER_BOMB:
+            chaos_headers["X-Chaos-Bomb"] = _HEADER_BOMB_VAL
+            
+        # FIX #3: Auto-inject Content-Type for body payloads
+        if body is not None:
+            chaos_headers.setdefault("Content-Type", "application/json")
+            
+        try:
+            kwargs: Dict[str, Any] = {"catch_response": True, "headers": chaos_headers}
+            if body is not None:
+                kwargs["body"] = body
+                
+            with self.client.request(method, path, name=name, **kwargs) as r:
+                code = r.status_code
+                body_resp = r.content
+
+                if code == 0:
+                    if RETRY_ON_NET:
+                        with self.client.request(method, path, name=name + " (retry)", **kwargs) as r2:
+                            _ = r2.content
+                            if r2.status_code == 200:
+                                r2.success()
+                            else:
+                                r2.failure(f"retry_http_{r2.status_code}")
+                        r.success()
+                    else:
+                        r.failure(self._classify_network_error(r))
+                    return
+
+                # FIX #11: Unified non-strict behavior
+                if not STRICT:
+                    if code >= 400:
+                        r.failure(f"http_{code}")
+                    else:
+                        r.success()
+                    return
+
+                if 200 <= code < 300:
+                    # FIX #1: Only check Content-Length if not compressed
+                    content_encoding = r.headers.get("Content-Encoding") or r.headers.get("content-encoding")
+                    if not content_encoding:
+                        cl = r.headers.get("Content-Length")
+                        if cl is not None:
+                            try:
+                                if len(body_resp) != int(cl):
+                                    r.failure(f"truncated_{len(body_resp)}_of_{cl}")
+                                    return
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # FIX #2: Ignore empty body for 204/205/HEAD/OPTIONS
+                    if len(body_resp) < 5 and code not in (204, 205) and method not in ("HEAD", "OPTIONS"):
+                        r.failure("suspicious_empty_body")
+                        return
+                    r.success()
+                    return
+
+                if 300 <= code < 400:
+                    r.failure(f"redirect_{code}")
+                    return
+                if 400 <= code < 500:
+                    r.failure(f"client_error_{code}")
+                    return
+                if 500 <= code < 600:
+                    r.failure(f"server_error_{code}")
+                    return
+                r.failure(f"unexpected_{code}")
+        except Exception as exc:
+            log.warning("Request exception: %s", exc)  # FIX #10
+
+    def _parallel_burst(self) -> None:
+        group = Group()
+        for _ in range(PARALLEL_N):
+            path, _ = rand_request()
+            method, body = self._roll_method_and_data()
+            group.spawn(self._do_request,
+                        _maybe_cache_bust(path),
+                        self._STAT_PARALLEL, method, body)
+        group.join()
+
+    def _heavy_request(self) -> None:
+        ep = _random_choice(HEAVY_ENDPOINTS)
+        self._do_request(ep, self._STAT_HEAVY)
+
+    def _cold_request(self) -> None:
+        """FIX #5: Pass Connection: close as extra_headers to avoid race condition."""
+        path, _ = rand_request()
+        method, body = self._roll_method_and_data()
+        self._do_request(path, self._STAT_COLD, method, body, 
+                         extra_headers={"Connection": "close"})
+
+    def _mutation_request(self) -> None:
+        ep = _random_choice(MUTATION_ENDPOINTS)
+        method = _random_choice(["POST", "PUT", "DELETE"])
+        body = b'{"mutation_chaos": true}' if method != "DELETE" else None
+        self._do_request(ep, self._STAT_MUTATION, method=method, body=body)
+
+    @tag("stress")
+    @task(1)
+    def stress_task(self) -> None:
+        if self._is_thunder_herd_active():
+            for _ in range(3):
+                path, name = rand_request()
+                method, body = self._roll_method_and_data()
+                self._do_request(_maybe_cache_bust(path), f"{name} (herd)", method, body)
+            return
+
+        roll = _random_random()
+
+        if MUTATION_PROB > 0.0 and roll < MUTATION_PROB:
+            self._mutation_request()
+            return
+
+        roll -= MUTATION_PROB
+
+        if (PARALLEL_N > 1 and PARALLEL_PROB > 0.0
+                and roll < PARALLEL_PROB):
+            self._parallel_burst()
+            return
+
+        roll -= PARALLEL_PROB if PARALLEL_N > 1 else 0.0
+
+        if HEAVY_ENDPOINTS and HEAVY_PROB > 0.0 and roll < HEAVY_PROB:
+            self._heavy_request()
+            return
+
+        if HEAVY_ENDPOINTS and HEAVY_PROB > 0.0:
+            roll -= HEAVY_PROB
+
+        if COLD_CONN and COLD_CONN_PROB > 0.0 and roll < COLD_CONN_PROB:
+            self._cold_request()
+            return
+
+        path, name = rand_request()
+        method, body = self._roll_method_and_data()
+        self._do_request(_maybe_cache_bust(path), name, method, body)
+
+
+# =============================================================================
+#  Load shape
+# =============================================================================
+class AdvancedLoadShape(LoadTestShape):
+    _step_duration = RUN_TIME / STEPS
+    _base_users    = TARGET_USERS // STEPS
+    _remainder     = TARGET_USERS - _base_users * STEPS
+    
+    _pulse_cycles = 3
+    _pulse_cycle_time = RUN_TIME / _pulse_cycles
+    _pulse_ramp_time = _pulse_cycle_time * 0.7
+
+    def tick(self) -> Optional[Tuple[int, int]]:
+        t = self.get_run_time()
+        if t >= RUN_TIME:
+            return None
+
+        if PULSE_SHAPE:
+            cycle_t = t % self._pulse_cycle_time
+            if cycle_t < self._pulse_ramp_time:
+                progress = cycle_t / self._pulse_ramp_time
+                users = int(TARGET_USERS * progress)
+                return (max(1, users), SPAWN_RATE)
+            else:
+                # FIX #13: Clamp spawn rate
+                return (max(1, int(TARGET_USERS * 0.05)), min(SPAWN_RATE * 2, 10000))
+
+        if BURST_MODE:
+            return (TARGET_USERS, SPAWN_RATE)
+
+        rung = min(int(t // self._step_duration) + 1, STEPS)
+        users = self._base_users * rung
+        if rung == STEPS:
+            users += self._remainder
+        return (users, SPAWN_RATE)
+
+
+# =============================================================================
+#  Event hooks
+# =============================================================================
+def _is_master_or_local(environment: Any) -> bool:
+    try:
+        return not isinstance(environment.runner, WorkerRunner)
+    except Exception:
+        return True
+
+
+@events.test_start.add_listener
+def _on_test_start(environment: Any, **_kw: Any) -> None:
+    if not _is_master_or_local(environment):
+        return
+
+    log.info("=" * 70)
+    log.info("CHAOS TEST STARTED  (v∞++++ PATCHED EDITION)")
+    log.info("Target     : %s", environment.host or "(missing!)")
+    log.info("Endpoints  : %s", ", ".join(_ENDPOINT_LIST))
+    log.info("Users      : up to %d in %d steps (spawn=%d/s)",
+             TARGET_USERS, STEPS, SPAWN_RATE)
+    log.info("Duration   : %ds", RUN_TIME)
+    log.info("Mode       : strict=%s retry=%s insecure=%s burst=%s",
+             STRICT, RETRY_ON_NET, INSECURE, BURST_MODE)
+    log.info("Wild v1    : cache_bust=%s parallel_n=%d (p=%.2f) "
+             "heavy=%d eps (p=%.2f) cold=%s (p=%.2f)",
+             CACHE_BUST, PARALLEL_N, PARALLEL_PROB,
+             len(HEAVY_ENDPOINTS), HEAVY_PROB,
+             COLD_CONN, COLD_CONN_PROB)
+    log.info("Wild v2    : spoof_ip=%s hdr_bomb=%s (%dKB) method_chaos=%s "
+             "mutation=%.2f deep_page=%s thunder=%s (%.0f%%) pulse=%s",
+             SPOOF_IP, HEADER_BOMB, HEADER_BOMB_KB, METHOD_CHAOS,
+             MUTATION_PROB, DEEP_PAGINATION,
+             THUNDER_HERD, THUNDER_THRESHOLD * 100, PULSE_SHAPE)
+    log.info("=" * 70)
+
+    if not environment.host:
+        log.error("FATAL: --host is required. Aborting.")
+        try:
+            environment.runner.quit()
+        except Exception:
+            pass
+        return
+
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: environment.runner.quit())
+    except (ValueError, AttributeError, OSError):
+        pass
+
+    stop_flag = _TEST_STATE["stop_flag"]
+
+    def _progress_reporter() -> None:
+        while not stop_flag["stop"]:
+            gevent.sleep(15)
+            if stop_flag["stop"]:
+                break
+            try:
+                s = environment.stats.total
+                total = max(1, s.num_requests)
+                p95 = s.get_response_time_percentile(0.95) or 0
+                log.info(
+                    "progress → %d reqs | %.0f RPS | %.2f%% fail | p95=%dms",
+                    s.num_requests, s.total_rps,
+                    100.0 * s.num_failures / total, p95,
+                )
+            except Exception as exc:
+                log.debug("progress error: %s", exc)
+
+    def _watchdog() -> None:
+        last_ok = {"count": 0, "ts": time.monotonic()}
+        while not stop_flag["stop"]:
+            gevent.sleep(10)
+            if stop_flag["stop"]:
+                break
+            try:
+                s = environment.stats.total
+                cur = s.num_requests - s.num_failures
+                if cur > last_ok["count"]:
+                    last_ok["count"] = cur
+                    last_ok["ts"] = time.monotonic()
+                elif time.monotonic() - last_ok["ts"] > 30:
+                    log.error("WATCHDOG: 30s no success — target may be down or blocked by WAF")
+                    last_ok["ts"] = time.monotonic()
+            except Exception as exc:
+                log.debug("watchdog error: %s", exc)
+
+    try:
+        _TEST_STATE["progress_greenlet"] = gevent.spawn(_progress_reporter)
+        _TEST_STATE["watchdog_greenlet"] = gevent.spawn(_watchdog)
+    except Exception as exc:
+        log.warning("Background tasks failed: %s", exc)
+
+
+@events.test_stop.add_listener
+def _on_test_stop(environment: Any, **_kw: Any) -> None:
+    flag = _TEST_STATE["stop_flag"]
+    flag["stop"] = True
+
+    if not _is_master_or_local(environment):
+        return
+
+    try:
+        s = environment.stats.total
+        total = max(1, s.num_requests)
+        log.info("=" * 70)
+        log.info("FINAL REPORT")
+        log.info("Requests    : %d", s.num_requests)
+        log.info("Failures    : %d (%.2f%%)",
+                 s.num_failures, 100.0 * s.num_failures / total)
+        log.info("RPS (avg)   : %.1f", s.total_rps)
+        log.info("Latency p50 : %d ms",
+                 s.get_response_time_percentile(0.50) or 0)
+        log.info("Latency p95 : %d ms",
+                 s.get_response_time_percentile(0.95) or 0)
+        log.info("Latency p99 : %d ms",
+                 s.get_response_time_percentile(0.99) or 0)
+        log.info("Max latency : %d ms", s.max_response_time or 0)
+        log.info("=" * 70)
+    except Exception as exc:
+        log.warning("Final report failed: %s", exc)
+
+# =============================================================================
+#  END OF FILE — v∞++++ PATCHED EDITION
+# ============================================================================= made by zopiros
